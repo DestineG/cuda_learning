@@ -54,19 +54,19 @@ __global__ void reduceSmem(float *input, float *output, int n) {
     __syncthreads();
     if (blockDim.x > 64 && tid < 64)   sdata[tid] += sdata[tid + 64];
     __syncthreads();
+    if (blockDim.x > 32 && tid < 32)   sdata[tid] += sdata[tid + 32];
+    __syncthreads();
 
     if (tid < 32) {
-        // 使用 volatile 确保每次访问都从共享内存中读取最新值(否则可能从寄存器中读取过时值)
-        volatile float *vsmem = sdata;
-        if (blockDim.x > 32) vsmem[tid] += vsmem[tid + 32];
-        if (blockDim.x > 16) vsmem[tid] += vsmem[tid + 16];
-        if (blockDim.x > 8)  vsmem[tid] += vsmem[tid + 8];
-        if (blockDim.x > 4)  vsmem[tid] += vsmem[tid + 4];
-        if (blockDim.x > 2)  vsmem[tid] += vsmem[tid + 2];
-        if (blockDim.x > 1)  vsmem[tid] += vsmem[tid + 1];
-    }
+        float val = sdata[tid]; 
+        if (blockDim.x > 16) val += __shfl_down_sync(0xffffffff, val, 16);
+        if (blockDim.x > 8)  val += __shfl_down_sync(0xffffffff, val, 8);
+        if (blockDim.x > 4)  val += __shfl_down_sync(0xffffffff, val, 4);
+        if (blockDim.x > 2)  val += __shfl_down_sync(0xffffffff, val, 2);
+        if (blockDim.x > 1)  val += __shfl_down_sync(0xffffffff, val, 1);
 
-    if (tid == 0) output[blockIdx.x] = sdata[0];
+        if (tid == 0) output[blockIdx.x] = val;
+    }
 }
 
 float testKernel(void (*kernel)(float*, float*, int), float* d_input, float* d_output, int n, int numBlocks, int blockSize, const char* name) {
