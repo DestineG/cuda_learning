@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cudnn.h>
 #include <iostream>
 #include <iomanip>
 #include <cmath>
@@ -349,6 +350,51 @@ __global__ void softmax_forward_kernel5(float* input, float* output, int batch_s
     }
 }
 
+// TODO: Vectorized Load/Store
+__global__ void softmax_forward_kernel6(float* input, float* output, int batch_size, int num_classes);
+
+void testSoftmaxCuDNN(float* d_input, float* d_output, int batch_size, int num_classes, const char* test_name) {
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    // 创建张量描述符
+    // cuDNN 是为深度学习设计的，所以它习惯 4D 张量 (N, C, H, W)
+    // 我们的数据是 (batch_size, num_classes)，对应 (N, C, 1, 1)
+    cudnnTensorDescriptor_t desc;
+    cudnnCreateTensorDescriptor(&desc);
+    cudnnSetTensor4dDescriptor(desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, batch_size, num_classes, 1, 1);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // 预热
+    float alpha = 1.0f, beta = 0.0f;
+    cudnnSoftmaxForward(handle, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
+                        &alpha, desc, d_input, &beta, desc, d_output);
+    cudaDeviceSynchronize();
+
+    // 正式计时
+    cudaEventRecord(start);
+    cudnnSoftmaxForward(handle, CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_MODE_INSTANCE,
+                        &alpha, desc, d_input, &beta, desc, d_output);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    std::cout << std::left << std::setw(30) << test_name 
+              << " | " << std::setw(15) << "cuDNN Library"
+              << " | Time: " << std::fixed << std::setprecision(4) << ms << " ms" 
+              << std::endl;
+
+    // 清理资源
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudnnDestroyTensorDescriptor(desc);
+    cudnnDestroy(handle);
+}
+
 void testSoftmax(void (*softmax_func)(float*, float*, int, int), float* input, float* output, int batch_size, int num_classes, const char* test_name) {
     // 记录开始时间
     auto start = std::chrono::high_resolution_clock::now();
@@ -456,6 +502,8 @@ int main() {
         testSoftmaxKernel(softmax_forward_kernel5, d_input, d_output, batch_size, num_classes, 
                           grid, block, sharedMem, "GPU Softmax Kernel 5");
     }
+
+    testSoftmaxCuDNN(d_input, d_output, batch_size, num_classes, "cuDNN Standard Accurate");
 
     cudaFree(d_input);
     cudaFree(d_output);
