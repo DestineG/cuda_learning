@@ -268,7 +268,7 @@ __global__ void matmulsharedThreadTiling_kernel(float *A, float *B, float *C, in
         (ThreadTileX * ThreadDimx * TILE_K) % (ThreadDimy * ThreadDimx) == 0,
         "ThreadTileX * TILE_K must be divisible by ThreadDimy");
 
-    __shared__ float tileA[ThreadTileY * ThreadDimy][TILE_K];
+    __shared__ float tileA[ThreadTileY * ThreadDimy][TILE_K + 1];
     __shared__ float tileB[TILE_K][ThreadTileX * ThreadDimx];
 
     float accum[ThreadTileY][ThreadTileX];
@@ -354,6 +354,7 @@ __global__ void matmulsharedThreadTiling_kernel(float *A, float *B, float *C, in
 /*
 summary:
 1. 只要 warp 内部线程之间操作是密集的，那么就不容易触发 BC
+2. 研究为何 [TILE_K + 1] 可以避免 bank conflict
 */
 
 /*
