@@ -148,18 +148,24 @@ __global__ void flashattn_kernel(
     int warp_id = thread_id / 32;
     int lane_id = thread_id % 32;
     int num_warps = num_threads / 32;
+    int q_block_rows = q_block_end - q_block_start;
 
-    // 每个 Warp 认领一行 Q, 计算过程: (Br, D) @ (Bc, D)^T @ (Bc, D) -> (Br, D)
-    for (int q_row = warp_id; q_row < (q_block_end - q_block_start); q_row += num_warps) {
+    // 让整个 block 按 tile 方式推进，每个 tile 里每个 warp 处理一行 Q
+    for (int q_tile_start = 0; q_tile_start < q_block_rows; q_tile_start += num_warps) {
+        int q_row = q_tile_start + warp_id;
+        bool active = q_row < q_block_rows;
+
         float row_max = -1e20f;
         float row_sum = 0.0f;
         float acc[D / 32];
-        #pragma unroll
-        for (int i = 0; i < D / 32; ++i) acc[i] = 0.0f;
+        if (active) {
+            #pragma unroll
+            for (int i = 0; i < D / 32; ++i) acc[i] = 0.0f;
+        }
 
         // (1, D) @ (Bc, D)^T @ (Bc, D) -> (1, D)
         for (int kv_block_start = 0; kv_block_start < kv_len; kv_block_start += Bc) {
-            
+
             // 搬运 K/V 到 Shared Memory
             __syncthreads(); // 确保上一轮计算已读完 smem
             for (int i = thread_id; i < (Bc * D) / 4; i += num_threads) {
@@ -178,14 +184,19 @@ __global__ void flashattn_kernel(
             }
             __syncthreads(); // 确保 K/V 搬运完成
 
+            // 如果当前 warp 没有有效的 Q 行，则跳过计算
+            if (!active) {
+                continue;
+            }
+
             // (1, D) @ (1, D)^T @ (1, D) -> (1, D)
             int min_k_row = min(Bc, kv_len - kv_block_start);
             for (int k_row = 0; k_row < min_k_row; ++k_row) {
-                
+
                 // 因果掩码判断
                 if (is_causal && (q_block_start + q_row < kv_block_start + k_row)) continue;
 
-                // // (1, D) @ (1, D)^T -> (1, 1)
+                // (1, D) @ (1, D)^T -> (1, 1)
                 float attn_score = 0.0f;
                 #pragma unroll
                 for (int d = lane_id; d < D; d += 32) {
@@ -203,7 +214,7 @@ __global__ void flashattn_kernel(
                 row_max = fmaxf(row_max, attn_score);
                 float rescale = expf(old_max - row_max);
                 float exp_score = expf(attn_score - row_max);
-                
+
                 row_sum = row_sum * rescale + exp_score;
 
                 // (1, 1) @ (1, D) -> (1, D)
@@ -215,11 +226,13 @@ __global__ void flashattn_kernel(
             }
         }
 
-        // 归一化并写回
-        #pragma unroll
-        for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
-            int d_idx = lane_id + acc_i * 32;
-            o_base_ptr[(q_block_start + q_row) * o_stride_token + d_idx] = static_cast<T>(acc[acc_i] / row_sum);
+        if (active) {
+            // 归一化并写回
+            #pragma unroll
+            for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
+                int d_idx = lane_id + acc_i * 32;
+                o_base_ptr[(q_block_start + q_row) * o_stride_token + d_idx] = static_cast<T>(acc[acc_i] / row_sum);
+            }
         }
     }
 }
@@ -228,17 +241,21 @@ int main() {
     using T = float;
 
     // ===== 参数 =====
-    const int B = 3;
+    const int B = 16;
     const int H = 32;
     const int H_k = 8;
-    const int D = 64;
+    const int D = 128;
+    const int min_seqlen_q = 256;
 
     const int Br = 32;
     const int Bc = 32;
 
     // ===== 每个序列长度（变长）=====
-    int q_lens[B] = {100, 64, 120};
-    int k_lens[B] = {120, 80, 100};
+    int q_lens[B], k_lens[B];
+    for (int i = 0; i < B; ++i) {
+        q_lens[i] = min_seqlen_q + (rand() % 128);
+        k_lens[i] = q_lens[i] + 1 + (rand() % 32);
+    }
 
     // ===== 计算 total tokens =====
     int total_q = 0;
@@ -377,12 +394,31 @@ int main() {
     double sum_abs_err = 0.0;
     double sum_sq_err = 0.0;
     float max_abs_err = 0.0f;
+    int max_abs_err_idx = -1;
     const int total_out = total_q * H * D;
     for (int i = 0; i < total_out; ++i) {
         const float diff = std::fabs(h_O[i] - h_O_ref[i]);
         sum_abs_err += diff;
         sum_sq_err += static_cast<double>(diff) * static_cast<double>(diff);
-        if (diff > max_abs_err) max_abs_err = diff;
+        if (diff > max_abs_err) {
+            max_abs_err = diff;
+            max_abs_err_idx = i;
+        }
+    }
+
+    int max_b = -1, max_q = -1, max_h = -1, max_d = -1;
+    if (max_abs_err_idx >= 0) {
+        int token_idx = max_abs_err_idx / (H * D);
+        int rem = max_abs_err_idx % (H * D);
+        max_h = rem / D;
+        max_d = rem % D;
+        for (int b = 0; b < B; ++b) {
+            if (token_idx >= h_cu_q[b] && token_idx < h_cu_q[b + 1]) {
+                max_b = b;
+                max_q = token_idx - h_cu_q[b];
+                break;
+            }
+        }
     }
 
     const double mean_abs_err = sum_abs_err / total_out;
@@ -395,6 +431,14 @@ int main() {
     std::cout << "max_abs_err = " << max_abs_err
               << ", mean_abs_err = " << mean_abs_err
               << ", rmse = " << rmse << std::endl;
+    if (max_abs_err_idx >= 0) {
+        std::cout << "max_abs_err_idx = " << max_abs_err_idx
+                  << " (b=" << max_b << ", q=" << max_q
+                  << ", h=" << max_h << ", d=" << max_d << ")"
+                  << ", GPU = " << h_O[max_abs_err_idx]
+                  << ", CPU = " << h_O_ref[max_abs_err_idx]
+                  << std::endl;
+    }
     std::cout << (pass ? "[PASS] GPU matches CPU reference" : "[FAIL] GPU mismatch vs CPU reference") << std::endl;
 
     // ===== free =====
