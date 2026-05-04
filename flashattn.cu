@@ -158,9 +158,14 @@ __global__ void flashattn_kernel(
         float row_max = -1e20f;
         float row_sum = 0.0f;
         float acc[D / 32];
+        float q_buf[D / 32];
+        
         if (active) {
             #pragma unroll
-            for (int i = 0; i < D / 32; ++i) acc[i] = 0.0f;
+            for (int i = 0; i < D / 32; ++i) {
+                acc[i] = 0.0f;
+                q_buf[i] = static_cast<float>(s_q[q_row * D + lane_id + i * 32]);
+            }
         }
 
         // (1, D) @ (Bc, D)^T @ (Bc, D) -> (1, D)
@@ -200,7 +205,7 @@ __global__ void flashattn_kernel(
                 float attn_score = 0.0f;
                 #pragma unroll
                 for (int d = lane_id; d < D; d += 32) {
-                    attn_score += static_cast<float>(s_q[q_row * D + d]) * static_cast<float>(s_k[k_row * D + d]);
+                    attn_score += static_cast<float>(q_buf[d / 32]) * static_cast<float>(s_k[k_row * D + d]);
                 }
                 // Warp 归约
                 #pragma unroll
