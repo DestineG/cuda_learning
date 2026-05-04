@@ -485,6 +485,7 @@ next kernel idea:
 3. 双缓冲技术：在计算当前 tile 的同时预加载下一个 tile，隐藏内存访问延迟
 4. 找找 Tensor Core 的使用机会，进一步提升性能
 5. 在计算外积的时候顺序为 读取(shared -> registers) -> 计算 串行执行，可以在计算的时候同时从 shared memory 加载下一组数据到寄存器中
+6. 考虑每个 warp 协同重新设计 tile 的布局和访问模式，以进一步减少 bank conflict 和提高数据重用率
 */
 
 void testThreadTilingKernel(
