@@ -486,6 +486,7 @@ next kernel idea:
 4. 找找 Tensor Core 的使用机会，进一步提升性能
 5. 在计算外积的时候顺序为 读取(shared -> registers) -> 计算 串行执行，可以在计算的时候同时从 shared memory 加载下一组数据到寄存器中
 6. 考虑每个 warp 协同重新设计 tile 的布局和访问模式，以进一步减少 bank conflict 和提高数据重用率
+7. 通过将矩阵维度向上填充至 4 或 32 的倍数以消除 Kernel 内的 if 边界判断，并在强制实现 float4 内存对齐的同时，让所有线程执行完全对称的计算路径
 */
 
 void testThreadTilingKernel(
