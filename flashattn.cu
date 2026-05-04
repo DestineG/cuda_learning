@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cassert>
+#include <vector>
+#include <algorithm>
 
 #define CHECK_CUDA(x) do { \
     cudaError_t err = x; \
@@ -11,6 +13,74 @@
         exit(-1); \
     } \
 } while(0)
+
+template<typename T>
+void flashattn_cpu_reference(
+    const T* Q,
+    const T* K,
+    const T* V,
+    T* O,
+    const int* cu_seqlens_q,
+    const int* cu_seqlens_k,
+    int B,
+    int num_heads,
+    int num_heads_k,
+    int D,
+    float scale,
+    int q_stride_token,
+    int q_stride_head,
+    int k_stride_token,
+    int k_stride_head,
+    int v_stride_token,
+    int v_stride_head,
+    int o_stride_token,
+    int o_stride_head,
+    bool is_causal
+) {
+    for (int b = 0; b < B; ++b) {
+        const int q_start = cu_seqlens_q[b];
+        const int kv_start = cu_seqlens_k[b];
+        const int q_len = cu_seqlens_q[b + 1] - q_start;
+        const int kv_len = cu_seqlens_k[b + 1] - kv_start;
+
+        for (int h = 0; h < num_heads; ++h) {
+            const int kv_h = h / (num_heads / num_heads_k);
+
+            for (int q_row = 0; q_row < q_len; ++q_row) {
+                float row_max = -1e20f;
+                float row_sum = 0.0f;
+                std::vector<float> acc(D, 0.0f);
+
+                for (int k_row = 0; k_row < kv_len; ++k_row) {
+                    if (is_causal && (q_row < k_row)) continue;
+
+                    float score = 0.0f;
+                    for (int d = 0; d < D; ++d) {
+                        const float qv = static_cast<float>(Q[(q_start + q_row) * q_stride_token + h * q_stride_head + d]);
+                        const float kv = static_cast<float>(K[(kv_start + k_row) * k_stride_token + kv_h * k_stride_head + d]);
+                        score += qv * kv;
+                    }
+                    score *= scale;
+
+                    const float old_max = row_max;
+                    row_max = std::max(row_max, score);
+                    const float rescale = std::exp(old_max - row_max);
+                    const float exp_score = std::exp(score - row_max);
+
+                    row_sum = row_sum * rescale + exp_score;
+                    for (int d = 0; d < D; ++d) {
+                        const float vv = static_cast<float>(V[(kv_start + k_row) * v_stride_token + kv_h * v_stride_head + d]);
+                        acc[d] = acc[d] * rescale + exp_score * vv;
+                    }
+                }
+
+                for (int d = 0; d < D; ++d) {
+                    O[(q_start + q_row) * o_stride_token + h * o_stride_head + d] = static_cast<T>(acc[d] / row_sum);
+                }
+            }
+        }
+    }
+}
 
 // Grid 的维度设计为 ((q_len + Br - 1) / Br, num_heads, batch)
 template<typename T, int Br, int Bc, int D>
@@ -196,11 +266,14 @@ int main() {
     T* h_K = (T*)malloc(total_kv * H_k * D * sizeof(T));
     T* h_V = (T*)malloc(total_kv * H_k * D * sizeof(T));
     T* h_O = (T*)malloc(total_q * H * D * sizeof(T));
+    T* h_O_ref = (T*)malloc(total_q * H * D * sizeof(T));
 
     int* h_cu_q = (int*)malloc((B + 1) * sizeof(int));
     int* h_cu_k = (int*)malloc((B + 1) * sizeof(int));
 
-    assert(h_Q && h_K && h_V && h_O && h_cu_q && h_cu_k);
+    assert(h_Q && h_K && h_V && h_O && h_O_ref && h_cu_q && h_cu_k);
+
+    srand(0);
 
     // ===== 初始化数据 =====
     for (int i = 0; i < total_q * H * D; ++i)
@@ -213,6 +286,9 @@ int main() {
 
     for (int i = 0; i < total_q * H * D; ++i)
         h_O[i] = 0;
+
+    for (int i = 0; i < total_q * H * D; ++i)
+        h_O_ref[i] = 0;
 
     // ===== 构造 cu_seqlens =====
     h_cu_q[0] = 0;
@@ -283,13 +359,50 @@ int main() {
     // ===== copy back =====
     CHECK_CUDA(cudaMemcpy(h_O, d_O, total_q * H * D * sizeof(T), cudaMemcpyDeviceToHost));
 
-    std::cout << "O[0] = " << h_O[0] << std::endl;
+    flashattn_cpu_reference(
+        h_Q, h_K, h_V, h_O_ref,
+        h_cu_q, h_cu_k,
+        B,
+        H,
+        H_k,
+        D,
+        scale,
+        q_stride_token, q_stride_head,
+        k_stride_token, k_stride_head,
+        v_stride_token, v_stride_head,
+        o_stride_token, o_stride_head,
+        true
+    );
+
+    double sum_abs_err = 0.0;
+    double sum_sq_err = 0.0;
+    float max_abs_err = 0.0f;
+    const int total_out = total_q * H * D;
+    for (int i = 0; i < total_out; ++i) {
+        const float diff = std::fabs(h_O[i] - h_O_ref[i]);
+        sum_abs_err += diff;
+        sum_sq_err += static_cast<double>(diff) * static_cast<double>(diff);
+        if (diff > max_abs_err) max_abs_err = diff;
+    }
+
+    const double mean_abs_err = sum_abs_err / total_out;
+    const double rmse = std::sqrt(sum_sq_err / total_out);
+    const float atol = 1e-3f;
+    const bool pass = max_abs_err < atol;
+
+    std::cout << "GPU O[0] = " << h_O[0] << std::endl;
+    std::cout << "CPU O_ref[0] = " << h_O_ref[0] << std::endl;
+    std::cout << "max_abs_err = " << max_abs_err
+              << ", mean_abs_err = " << mean_abs_err
+              << ", rmse = " << rmse << std::endl;
+    std::cout << (pass ? "[PASS] GPU matches CPU reference" : "[FAIL] GPU mismatch vs CPU reference") << std::endl;
 
     // ===== free =====
     free(h_Q);
     free(h_K);
     free(h_V);
     free(h_O);
+    free(h_O_ref);
     free(h_cu_q);
     free(h_cu_k);
 
