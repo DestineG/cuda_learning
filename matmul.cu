@@ -5,6 +5,16 @@
 #include <cublas_v2.h>
 #include <assert.h>
 
+void print_performance(const char* name, float milliseconds, double tflops) {
+    std::cout << std::left  << std::setw(45) << name 
+              << std::left  << std::setw(10) << " | Time: " 
+              << std::right << std::setw(12)  << std::fixed << std::setprecision(4) << milliseconds 
+              << std::left  << std::setw(5)  << " ms" 
+              << std::left  << std::setw(12) << " | TFLOPS: " 
+              << std::right << std::setw(8)  << std::fixed << std::setprecision(4) << tflops 
+              << std::endl;
+}
+
 void matrixMultiply_cpu(float *A, float *B, float *C, int M, int K, int P) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < P; ++j) {
@@ -30,9 +40,7 @@ void testCPUKernel(float *A, float *B, float *C, int M, int K, int P, const char
     double ops = 2.0 * M * K * P;
     double tflops = (ops / (duration.count() / 1000.0)) / 1e12;
 
-    std::cout << std::left << std::setw(40) << name 
-              << " | Time: " << std::fixed << std::setprecision(4) << duration.count() << " ms"
-              << " | TFLOPS: " << tflops << std::endl;
+    print_performance(name, duration.count(), tflops);
 }
 
 void testCublasGEMM(float *d_A, float *d_B, float *d_C, int M, int K, int P) {
@@ -57,15 +65,13 @@ void testCublasGEMM(float *d_A, float *d_B, float *d_C, int M, int K, int P) {
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
 
     double ops = 2.0 * M * K * P;
-    double tflops = (ops / (ms / 1000.0)) / 1e12;
+    double tflops = (ops / (milliseconds / 1000.0)) / 1e12;
 
-    std::cout << std::left << std::setw(40) << "cuBLAS Standard" 
-              << " | Time: " << std::fixed << std::setprecision(4) << ms << " ms"
-              << " | TFLOPS: " << tflops << std::endl;
+    print_performance("cuBLAS Standard", milliseconds, tflops);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -248,9 +254,7 @@ void testMatrixKernel(
     double ops = 2.0 * M * K * P;
     double tflops = (ops / (milliseconds / 1000.0)) / 1e12;
 
-    std::cout << std::left << std::setw(40) << name 
-              << " | Time: " << std::fixed << std::setprecision(4) << milliseconds << " ms"
-              << " | TFLOPS: " << tflops << std::endl;
+    print_performance(name, milliseconds, tflops);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -351,6 +355,123 @@ __global__ void matmulsharedThreadTiling_kernel(float *A, float *B, float *C, in
     }
 }
 
+template <int ThreadDimx, int ThreadDimy, int ThreadTileX, int ThreadTileY, int TILE_K>
+__global__ void matmulsharedThreadTilingFloat4_kernel(float *A, float *B, float *C, int M, int K, int P) {
+    // 确保 Tile 宽度是 4 的倍数，且搬运总量能被 (线程数 * 4) 整除
+    static_assert(TILE_K % 4 == 0, "TILE_K must be a multiple of 4 for float4 loading");
+    static_assert((ThreadTileX * ThreadDimx) % 4 == 0, "TileB width must be a multiple of 4");
+    
+    // 确保搬运次数是整数，避免处理搬运剩余元素的复杂逻辑
+    static_assert(
+        (ThreadDimy * ThreadTileY * TILE_K) % (ThreadDimy * ThreadDimx * 4) == 0,
+        "Total elements in TileA must be divisible by (num_threads * 4)");
+    static_assert(
+        (ThreadTileX * ThreadDimx * TILE_K) % (ThreadDimy * ThreadDimx * 4) == 0,
+        "Total elements in TileB must be divisible by (num_threads * 4)");
+
+    __shared__ float tileA[ThreadTileY * ThreadDimy][TILE_K + 1];
+    __shared__ float tileB[TILE_K][ThreadTileX * ThreadDimx];
+
+    float accum[ThreadTileY][ThreadTileX];
+    #pragma unroll
+    for (int i = 0; i < ThreadTileY; ++i) {
+        for (int j = 0; j < ThreadTileX; ++j) {
+            accum[i][j] = 0.0f;
+        }
+    }
+
+    int threadsPerBlock = ThreadDimy * ThreadDimx;
+    int tid = threadIdx.y * ThreadDimx + threadIdx.x;
+
+    for (int t = 0; t < (K + TILE_K - 1) / TILE_K; ++t) {
+        
+        // 填充 tileA
+        int globalARowBase = blockIdx.y * (ThreadDimy * ThreadTileY);
+        int globalAColBase = t * TILE_K;
+        int numLoadsA = (ThreadDimy * ThreadTileY * TILE_K) / (threadsPerBlock * 4);
+
+        #pragma unroll
+        for (int i = 0; i < numLoadsA; ++i) {
+            int idx = tid + i * threadsPerBlock;
+            int localRow = (idx * 4) / TILE_K;
+            int localCol = (idx * 4) % TILE_K;
+            int globalRow = globalARowBase + localRow;
+            int globalCol = globalAColBase + localCol;
+
+            if (globalRow < M && globalCol < K) {
+                // 要求 A 的地址偏移必须对齐 128-bit
+                float4 tmp = reinterpret_cast<float4*>(&A[globalRow * K + globalCol])[0];
+                tileA[localRow][localCol]     = tmp.x;
+                tileA[localRow][localCol + 1] = tmp.y;
+                tileA[localRow][localCol + 2] = tmp.z;
+                tileA[localRow][localCol + 3] = tmp.w;
+            } else {
+                tileA[localRow][localCol] = tileA[localRow][localCol+1] = 
+                tileA[localRow][localCol+2] = tileA[localRow][localCol+3] = 0.0f;
+            }
+        }
+
+        // 填充 tileB
+        int globalBRowBase = t * TILE_K;
+        int globalBColBase = blockIdx.x * (ThreadDimx * ThreadTileX);
+        int numLoadsB = (TILE_K * ThreadDimx * ThreadTileX) / (threadsPerBlock * 4);
+
+        #pragma unroll
+        for (int i = 0; i < numLoadsB; ++i) {
+            int idx = tid + i * threadsPerBlock;
+            int localRow = (idx * 4) / (ThreadDimx * ThreadTileX);
+            int localCol = (idx * 4) % (ThreadDimx * ThreadTileX);
+            int globalRow = globalBRowBase + localRow;
+            int globalCol = globalBColBase + localCol;
+
+            if (globalRow < K && globalCol < P) {
+                float4 tmp = reinterpret_cast<float4*>(&B[globalRow * P + globalCol])[0];
+                tileB[localRow][localCol]     = tmp.x;
+                tileB[localRow][localCol + 1] = tmp.y;
+                tileB[localRow][localCol + 2] = tmp.z;
+                tileB[localRow][localCol + 3] = tmp.w;
+            } else {
+                tileB[localRow][localCol] = tileB[localRow][localCol+1] = 
+                tileB[localRow][localCol+2] = tileB[localRow][localCol+3] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // 计算
+        #pragma unroll
+        for (int k = 0; k < TILE_K; ++k) {
+            float regA[ThreadTileY];
+            float regB[ThreadTileX];
+            #pragma unroll
+            for (int i = 0; i < ThreadTileY; ++i) regA[i] = tileA[threadIdx.y * ThreadTileY + i][k];
+            #pragma unroll
+            for (int j = 0; j < ThreadTileX; ++j) regB[j] = tileB[k][threadIdx.x * ThreadTileX + j];
+            
+            #pragma unroll
+            for (int i = 0; i < ThreadTileY; ++i) {
+                for (int j = 0; j < ThreadTileX; ++j) {
+                    accum[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // 写回
+    int globalCTileRow = blockIdx.y * (ThreadDimy * ThreadTileY) + (threadIdx.y * ThreadTileY);
+    int globalCTileCol = blockIdx.x * (ThreadDimx * ThreadTileX) + (threadIdx.x * ThreadTileX);
+    for (int i = 0; i < ThreadTileY; ++i) {
+        for (int j = 0; j < ThreadTileX; ++j) {
+            int row = globalCTileRow + i;
+            int col = globalCTileCol + j;
+            if (row < M && col < P) {
+                C[row * P + col] = accum[i][j];
+            }
+        }
+    }
+}
+
 /*
 summary:
 1. 只要 warp 内部线程之间操作是密集的，那么就不容易触发 BC
@@ -419,9 +540,7 @@ void testThreadTilingKernel(
     double ops = 2.0 * M * K * P;
     double tflops = (ops / (milliseconds / 1000.0)) / 1e12;
 
-    std::cout << std::left << std::setw(40) << name 
-              << " | Time: " << std::fixed << std::setprecision(4) << milliseconds << " ms"
-              << " | TFLOPS: " << tflops << std::endl;
+    print_performance(name, milliseconds, tflops);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -480,15 +599,22 @@ int main() {
 
     // 计算 CPU 基准结果
     testCPUKernel(h_A, h_B_col, h_C_ref, M, K, P, "CPU Naive GEMM");
+    std::cout << std::string(85, '-') << std::endl;
 
     // 验证逻辑辅助 Lambda
     auto verify = [&](const char* kernelName) {
         cudaMemcpy(h_C_gpu, d_C, size_C, cudaMemcpyDeviceToHost);
+        
+        std::cout << std::left << std::setw(45) << "   >> [Verification]" 
+                << std::left << std::setw(10) << " | Result: ";
+        
         if (verify_result(h_C_ref, h_C_gpu, M, P)) {
-            std::cout << "   >> [Verification] " << kernelName << ": PASSED" << std::endl;
+            std::cout << "PASSED" << std::endl;
         } else {
-            std::cout << "   >> [Verification] " << kernelName << ": FAILED!" << std::endl;
+            std::cout << "FAILED!" << std::endl;
         }
+        
+        std::cout << std::string(85, '-') << std::endl;
     };
     
     // GPU Naive
@@ -521,6 +647,21 @@ int main() {
             "GPU Shared Memory Thread Tiling GEMM"
         );
         verify("GPU Shared Memory Thread Tiling GEMM");
+    }
+
+    {
+        const int ThreadDimx = 16;
+        const int ThreadDimy = 16;
+        const int ThreadTileX = 8;
+        const int ThreadTileY = 8;
+        const int TILE_K = 16;
+        testThreadTilingKernel(
+            matmulsharedThreadTilingFloat4_kernel<ThreadDimx, ThreadDimy, ThreadTileX, ThreadTileY, TILE_K>, 
+            d_A, d_B_row, d_C, M, K, P, 
+            ThreadDimx, ThreadDimy, ThreadTileX, ThreadTileY, 
+            "GPU Shared Memory Thread Tiling Float4 GEMM"
+        );
+        verify("GPU Shared Memory Thread Tiling Float4 GEMM");
     }
 
     testCublasGEMM(d_A, d_B_row, d_C, M, K, P);
