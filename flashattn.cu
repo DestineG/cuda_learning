@@ -136,22 +136,38 @@ __global__ void flashattn_kernel(
     int num_warps = num_threads / 32;
     int q_block_rows = q_block_end - q_block_start;
 
-    // 让整个 block 按 tile 方式推进，每个 tile 里每个 warp 处理一行 Q
-    for (int q_tile_start = 0; q_tile_start < q_block_rows; q_tile_start += num_warps) {
-        int q_row = q_tile_start + warp_id;
-        bool active = q_row < q_block_rows;
+    // 让整个 block 按 tile 方式推进，每个 warp 顺序处理两行 Q
+    const int q_rows_per_warp = 2;
+    for (int q_tile_start = 0; q_tile_start < q_block_rows; q_tile_start += num_warps * q_rows_per_warp) {
+        int q_row0 = q_tile_start + warp_id * q_rows_per_warp;
+        int q_row1 = q_row0 + 1;
+        bool active0 = q_row0 < q_block_rows;
+        bool active1 = q_row1 < q_block_rows;
 
-        float row_max = -1e20f;
-        float row_sum = 0.0f;
-        float acc[D / 32];
-        float q_buf[D / 32];
-        
-        if (active) {
+        float row_max0 = -1e20f;
+        float row_sum0 = 0.0f;
+        float row_max1 = -1e20f;
+        float row_sum1 = 0.0f;
+        float acc0[D / 32];
+        float acc1[D / 32];
+        float q_buf0[D / 32];
+        float q_buf1[D / 32];
+
+        if (active0) {
             #pragma unroll
             for (int i = 0; i < D / 32; ++i) {
-                acc[i] = 0.0f;
+                acc0[i] = 0.0f;
                 int d_idx_q = lane_id + i * 32;
-                q_buf[i] = static_cast<float>(q_base_ptr[(q_block_start + q_row) * q_stride_token + d_idx_q]);
+                q_buf0[i] = static_cast<float>(q_base_ptr[(q_block_start + q_row0) * q_stride_token + d_idx_q]);
+            }
+        }
+
+        if (active1) {
+            #pragma unroll
+            for (int i = 0; i < D / 32; ++i) {
+                acc1[i] = 0.0f;
+                int d_idx_q = lane_id + i * 32;
+                q_buf1[i] = static_cast<float>(q_base_ptr[(q_block_start + q_row1) * q_stride_token + d_idx_q]);
             }
         }
 
@@ -178,53 +194,85 @@ __global__ void flashattn_kernel(
             __syncthreads(); // 确保 K/V 搬运完成
 
             // 如果当前 warp 没有有效的 Q 行，则跳过计算
-            if (!active) {
+            if (!active0 && !active1) {
                 continue;
             }
 
-            // (1, D) @ (1, D)^T @ (1, D) -> (1, D)
             int min_k_row = min(Bc, kv_len - kv_block_start);
             for (int k_row = 0; k_row < min_k_row; ++k_row) {
+                // 第一行 Q
+                if (active0) {
+                    if (!(is_causal && (q_block_start + q_row0 < kv_block_start + k_row))) {
+                        float attn_score0 = 0.0f;
+                        #pragma unroll
+                        for (int d = lane_id; d < D; d += 32) {
+                            attn_score0 += static_cast<float>(q_buf0[d / 32]) * static_cast<float>(s_k[k_row * D + d]);
+                        }
+                        #pragma unroll
+                        for (int offset = 16; offset > 0; offset /= 2)
+                            attn_score0 += __shfl_down_sync(0xffffffff, attn_score0, offset);
+                        attn_score0 = __shfl_sync(0xffffffff, attn_score0, 0);
+                        attn_score0 *= scale;
 
-                // 因果掩码判断
-                if (is_causal && (q_block_start + q_row < kv_block_start + k_row)) continue;
+                        float old_max0 = row_max0;
+                        row_max0 = fmaxf(row_max0, attn_score0);
+                        float rescale0 = expf(old_max0 - row_max0);
+                        float exp_score0 = expf(attn_score0 - row_max0);
 
-                // (1, D) @ (1, D)^T -> (1, 1)
-                float attn_score = 0.0f;
-                #pragma unroll
-                for (int d = lane_id; d < D; d += 32) {
-                    attn_score += static_cast<float>(q_buf[d / 32]) * static_cast<float>(s_k[k_row * D + d]);
+                        row_sum0 = row_sum0 * rescale0 + exp_score0;
+
+                        #pragma unroll
+                        for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
+                            int d_idx = lane_id + acc_i * 32;
+                            acc0[acc_i] = acc0[acc_i] * rescale0 + exp_score0 * static_cast<float>(s_v[k_row * D + d_idx]);
+                        }
+                    }
                 }
-                // Warp 归约
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset /= 2)
-                    attn_score += __shfl_down_sync(0xffffffff, attn_score, offset);
-                attn_score = __shfl_sync(0xffffffff, attn_score, 0);
-                attn_score *= scale;
 
-                // Online Softmax
-                float old_max = row_max;
-                row_max = fmaxf(row_max, attn_score);
-                float rescale = expf(old_max - row_max);
-                float exp_score = expf(attn_score - row_max);
+                // 第二行 Q
+                if (active1) {
+                    if (!(is_causal && (q_block_start + q_row1 < kv_block_start + k_row))) {
+                        float attn_score1 = 0.0f;
+                        #pragma unroll
+                        for (int d = lane_id; d < D; d += 32) {
+                            attn_score1 += static_cast<float>(q_buf1[d / 32]) * static_cast<float>(s_k[k_row * D + d]);
+                        }
+                        #pragma unroll
+                        for (int offset = 16; offset > 0; offset /= 2)
+                            attn_score1 += __shfl_down_sync(0xffffffff, attn_score1, offset);
+                        attn_score1 = __shfl_sync(0xffffffff, attn_score1, 0);
+                        attn_score1 *= scale;
 
-                row_sum = row_sum * rescale + exp_score;
+                        float old_max1 = row_max1;
+                        row_max1 = fmaxf(row_max1, attn_score1);
+                        float rescale1 = expf(old_max1 - row_max1);
+                        float exp_score1 = expf(attn_score1 - row_max1);
 
-                // (1, 1) @ (1, D) -> (1, D)
-                #pragma unroll
-                for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
-                    int d_idx = lane_id + acc_i * 32;
-                    acc[acc_i] = acc[acc_i] * rescale + exp_score * static_cast<float>(s_v[k_row * D + d_idx]);
+                        row_sum1 = row_sum1 * rescale1 + exp_score1;
+
+                        #pragma unroll
+                        for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
+                            int d_idx = lane_id + acc_i * 32;
+                            acc1[acc_i] = acc1[acc_i] * rescale1 + exp_score1 * static_cast<float>(s_v[k_row * D + d_idx]);
+                        }
+                    }
                 }
             }
         }
 
-        if (active) {
-            // 归一化并写回
+        if (active0) {
             #pragma unroll
             for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
                 int d_idx = lane_id + acc_i * 32;
-                o_base_ptr[(q_block_start + q_row) * o_stride_token + d_idx] = static_cast<T>(acc[acc_i] / row_sum);
+                o_base_ptr[(q_block_start + q_row0) * o_stride_token + d_idx] = static_cast<T>(acc0[acc_i] / row_sum0);
+            }
+        }
+
+        if (active1) {
+            #pragma unroll
+            for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
+                int d_idx = lane_id + acc_i * 32;
+                o_base_ptr[(q_block_start + q_row1) * o_stride_token + d_idx] = static_cast<T>(acc1[acc_i] / row_sum1);
             }
         }
     }
