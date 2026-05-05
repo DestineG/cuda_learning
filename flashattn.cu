@@ -230,6 +230,12 @@ __global__ void flashattn_kernel(
     }
 }
 
+/*
+优化思路：
+1. 设置 KV 双缓冲(不爆 shared memory)
+2. 每个 warp 处理多行 Q(减少最外层 for 循环，增加每个 warp 内的计算量)
+*/
+
 int main() {
     using T = float;
 
