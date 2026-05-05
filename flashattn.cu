@@ -125,24 +125,10 @@ __global__ void flashattn_kernel(
     const T* v_base_ptr = V + kv_start * v_stride_token + kv_head_idx * v_stride_head;
     T* o_base_ptr = O + q_start * o_stride_token + head_idx * o_stride_head;
 
-    // Shared Memory 布局
+    // Shared Memory 布局 —— K/V 块
     extern __shared__ char smem[];
-    T* s_q = reinterpret_cast<T*>(smem);
-    T* s_k = s_q + Br * D;
+    T* s_k = reinterpret_cast<T*>(smem);
     T* s_v = s_k + Bc * D;
-
-    // 搬运 Q 到 Shared Memory
-    for (int i = thread_id; i < (Br * D) / 4; i += num_threads) {
-        int row = (i * 4) / D;
-        int col = (i * 4) % D;
-        if (q_block_start + row < q_len) {
-            reinterpret_cast<float4*>(s_q + row * D + col)[0] = 
-                reinterpret_cast<const float4*>(q_base_ptr + (q_block_start + row) * q_stride_token + col)[0];
-        } else {
-            reinterpret_cast<float4*>(s_q + row * D + col)[0] = make_float4(0,0,0,0);
-        }
-    }
-    __syncthreads();
 
     // 初始化 Warp 协作变量
     int warp_id = thread_id / 32;
@@ -164,10 +150,12 @@ __global__ void flashattn_kernel(
             #pragma unroll
             for (int i = 0; i < D / 32; ++i) {
                 acc[i] = 0.0f;
-                q_buf[i] = static_cast<float>(s_q[q_row * D + lane_id + i * 32]);
+                int d_idx_q = lane_id + i * 32;
+                q_buf[i] = static_cast<float>(q_base_ptr[(q_block_start + q_row) * q_stride_token + d_idx_q]);
             }
         }
 
+        // 遍历 K/V 块，每次处理 Bc 行 K/V
         // (1, D) @ (Bc, D)^T @ (Bc, D) -> (1, D)
         for (int kv_block_start = 0; kv_block_start < kv_len; kv_block_start += Bc) {
 
@@ -252,6 +240,9 @@ int main() {
     const int D = 128;
     const int min_seqlen_q = 256;
 
+    // 4090 shared memory 是 48KB=48*1024 bytes
+    // 48*1024 bytes >= (2 * Bc) * D * sizeof(T) = Bc * 2 * 128 * 4 bytes
+    // => Bc <= 48*1024 / (2 * 128 * 4) = 48*1024 / 1024 = 48
     const int Br = 32;
     const int Bc = 32;
 
@@ -357,7 +348,8 @@ int main() {
 
     dim3 block(128);
 
-    size_t smem_size = (Br + 2 * Bc) * D * sizeof(T);
+    // only K/V blocks are stored in shared memory now
+    size_t smem_size = (2 * Bc) * D * sizeof(T);
 
     float scale = 1.0f / sqrtf((float)D);
 
