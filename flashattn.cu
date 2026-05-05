@@ -137,7 +137,7 @@ __global__ void flashattn_kernel(
     int q_block_rows = q_block_end - q_block_start;
 
     // 让整个 block 按 tile 方式推进，每个 tile 里每个 warp 处理一行 Q
-    const int warp_handle_row = 4;
+    const int warp_handle_row = 2;
     for (int q_tile_start = 0; q_tile_start < q_block_rows; q_tile_start += warp_handle_row * num_warps) {
         int q_row[warp_handle_row];
         #pragma unroll
@@ -212,13 +212,14 @@ __global__ void flashattn_kernel(
                 }
                 #pragma unroll
                 for (int d = lane_id; d < D; d += 32) {
+                    float k_val = static_cast<float>(s_k[k_row * D + d]);
                     #pragma unroll
                     for (int q_i = 0; q_i < active_count; ++q_i) {
                         if (causal_mask[q_i]) {
                             attn_score[q_i] = -1e20f; // Apply causal mask
                         }
                         else {
-                            attn_score[q_i] += static_cast<float>(q_buf[q_i][d / 32]) * static_cast<float>(s_k[k_row * D + d]);
+                            attn_score[q_i] += static_cast<float>(q_buf[q_i][d / 32]) * k_val;
                         }
                     }
                 }
@@ -253,9 +254,10 @@ __global__ void flashattn_kernel(
                 #pragma unroll
                 for (int acc_i = 0; acc_i < D / 32; ++acc_i) {
                     int d_idx = lane_id + acc_i * 32;
+                    float v_val = static_cast<float>(s_v[k_row * D + d_idx]);
                     #pragma unroll
                     for (int q_i = 0; q_i < active_count; ++q_i) {
-                        acc[q_i][acc_i] = acc[q_i][acc_i] * rescale[q_i] + exp_score[q_i] * static_cast<float>(s_v[k_row * D + d_idx]);
+                        acc[q_i][acc_i] = acc[q_i][acc_i] * rescale[q_i] + exp_score[q_i] * v_val;
                     }
                 }
             }
@@ -274,9 +276,16 @@ __global__ void flashattn_kernel(
 }
 
 /*
+duration compute-throughput memory-throughput register
+1 row/warp: 7.81 45.66 44.72 47
+硬编码 2 row/warp: 7.38 54 43 56
+软编码 2 row/warp: 15.52 45.80 30.88 55
+软编码 4 row/warp: 14.36 45.54 36.11 72
+
+
+
 优化思路：
 1. 设置 KV 双缓冲(不爆 shared memory)
-2. 每个 warp 处理多行 Q(减少最外层 for 循环，增加每个 warp 内的计算量)
 */
 
 int main() {
