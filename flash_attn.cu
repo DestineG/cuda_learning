@@ -811,9 +811,6 @@ __global__ void flashattn_kernel_v5_async_vectorized(
     T* s_k = s_q + Br * D;                              // (2, Bc, D)
     T* s_v = s_k + 2 * Bc * D;                          // (2, Bc, D)
     T* s_o = s_q;                                       // (Br, D) 结果直接写回 s_q 随后 vectorized store 回全局内存
-    bool write_ptr_toggle = 0;                          // 双缓冲切换标志位
-    bool read_ptr_toggle = 1 - write_ptr_toggle;        // 双缓冲切换标志位
-
 
     /* 将 tileQ(Br, D) 加载到 shared memory(每个 warp 负责一行) */
     constexpr int VEC_SIZE = 16 / sizeof(T);
@@ -821,24 +818,6 @@ __global__ void flashattn_kernel_v5_async_vectorized(
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int num_warps = blockDim.x / 32;
-    // 预读取 tileKV
-    int first_tile_rows = min(Bc, kv_token_end - kv_token_idx);
-    for (int k_i = warp_id; k_i < first_tile_rows; k_i += num_warps) {
-        #pragma unroll
-        for (int d_vec = lane_id; d_vec < D_VEC; d_vec += 32) {
-            __pipeline_memcpy_async(
-                &s_k[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE], 
-                k_base_ptr + k_i * k_stride_token + d_vec * VEC_SIZE, 
-                16
-            );
-            __pipeline_memcpy_async(
-                &s_v[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE], 
-                v_base_ptr + k_i * v_stride_token + d_vec * VEC_SIZE, 
-                16
-            );
-        }
-    }
-    __pipeline_commit();
 
     for (int q_i = warp_id; q_i < q_block_rows; q_i += num_warps) {
         uint4* s_q_row = reinterpret_cast<uint4*>(&s_q[q_i * D]);
@@ -860,6 +839,27 @@ __global__ void flashattn_kernel_v5_async_vectorized(
         float row_sum = 0.0f;
         float acc[D / 32] = {0.0f};
         float q_buf[D / 32];
+
+        // 每组 q_tile 都重扫 KV；双缓冲指针与首轮 cp.async 须在此重置，否则会沿用上一组状态。
+        bool write_ptr_toggle = 0;
+        bool read_ptr_toggle;
+        int first_tile_rows = min(Bc, kv_token_end - kv_token_idx);
+        for (int k_i = warp_id; k_i < first_tile_rows; k_i += num_warps) {
+            #pragma unroll
+            for (int d_vec = lane_id; d_vec < D_VEC; d_vec += 32) {
+                __pipeline_memcpy_async(
+                    &s_k[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE],
+                    k_base_ptr + k_i * k_stride_token + d_vec * VEC_SIZE,
+                    16
+                );
+                __pipeline_memcpy_async(
+                    &s_v[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE],
+                    v_base_ptr + k_i * v_stride_token + d_vec * VEC_SIZE,
+                    16
+                );
+            }
+        }
+        __pipeline_commit();
 
         if (q_row_idx < q_block_rows) {
             #pragma unroll
@@ -935,6 +935,7 @@ __global__ void flashattn_kernel_v5_async_vectorized(
                     }
                 }
             }
+            __syncthreads();
         }
         /* 计算最后一个 tileKV */
 
@@ -1178,7 +1179,7 @@ int main() {
     const int D = 64;
     const int Br = 32;
     const int Bc = 32;
-    const int min_seqlen_q = 512;
+    const int min_seqlen_q = 256;
 
     int q_lens[B], k_lens[B];
     for (int i = 0; i < B; ++i) {
