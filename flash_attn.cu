@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include <iostream>
 #include <iomanip>
 #include <cmath>
@@ -745,6 +746,222 @@ __global__ void flashattn_kernel_v4_vectorized(
 }
 
 
+// <<<Grid, Block>>> = <<<(Br_idx, head_idx, seq_idx), (128, 1, 1)>>>
+template<typename T, int Br, int Bc, int D>
+__global__ void flashattn_kernel_v5_async_vectorized(
+    const T* __restrict__ Q,                    // (Total_Q, H, D)
+    const T* __restrict__ K,                    // (Total_KV, H_k, D)
+    const T* __restrict__ V,                    // (Total_KV, H_k, D)
+    T* __restrict__ O,                          // (Total_Q, H, D)
+    const int* __restrict__ cu_seq_len_q,          // (B+1,)
+    const int* __restrict__ cu_seq_len_k,          // (B+1,)
+    const int max_seqlen_q,
+    const int max_seqlen_k,
+    const float scale,
+    const int num_heads,
+    const int num_heads_k,
+    const int q_stride_token, const int q_stride_head,
+    const int k_stride_token, const int k_stride_head,
+    const int v_stride_token, const int v_stride_head,
+    const int o_stride_token, const int o_stride_head,
+    bool is_causal
+) {
+    /* 静态断言，确保 D 维度是 128-bit 对齐的，以便使用 uint4 进行 vectorized load/store */
+    static_assert(D * sizeof(T) % 16 == 0, "D dimension must be 128-bit aligned for vectorization");
+
+    /* 静态断言，确保 D 能够被 Warp Size (32) 整除，以便在 32 个线程间均匀分配寄存器累加器 */
+    static_assert(D % 32 == 0, "D must be a multiple of 32 for warp-level tiling");
+
+    /* base_ptr 计算(token_idx*stride_token + head_idx*stride_head) */
+    int seq_idx = blockIdx.z;
+    int q_start = cu_seq_len_q[seq_idx];
+    int q_end = cu_seq_len_q[seq_idx + 1];              // 左闭右开区间 [q_start, q_end)
+    int q_block_idx = blockIdx.x;
+    int q_token_idx = q_start + q_block_idx * Br;
+    if (q_token_idx >= q_end) return;                   // 超出范围的 token 直接返回
+    int q_block_end = min(q_token_idx + Br, q_end);
+    int q_block_rows = q_block_end - q_token_idx;
+    const T* q_base_ptr = (
+        Q
+        + q_token_idx * q_stride_token
+        + blockIdx.y * q_stride_head
+    );
+    T* o_base_ptr = (
+        O
+        + q_token_idx * o_stride_token
+        + blockIdx.y * o_stride_head
+    );
+    int kv_token_idx = cu_seq_len_k[seq_idx];
+    int kv_token_end = cu_seq_len_k[seq_idx + 1];
+    int kv_head_idx = blockIdx.y / (num_heads / num_heads_k);
+    const T* k_base_ptr = (
+        K
+        + kv_token_idx * k_stride_token
+        + kv_head_idx * k_stride_head
+    );
+    const T* v_base_ptr = (
+        V
+        + kv_token_idx * v_stride_token
+        + kv_head_idx * v_stride_head
+    );
+
+    /* shared memory(使用 char 作为原始类型，后续通过指针转换为 T*) */
+    extern __shared__ char smem_raw[];
+    T* s_q = reinterpret_cast<T*>(smem_raw);            // (Br, D)
+    T* s_k = s_q + Br * D;                              // (2, Bc, D)
+    T* s_v = s_k + 2 * Bc * D;                          // (2, Bc, D)
+    T* s_o = s_q;                                       // (Br, D) 结果直接写回 s_q 随后 vectorized store 回全局内存
+    bool write_ptr_toggle = 0;                          // 双缓冲切换标志位
+    bool read_ptr_toggle = 1 - write_ptr_toggle;        // 双缓冲切换标志位
+
+
+    /* 将 tileQ(Br, D) 加载到 shared memory(每个 warp 负责一行) */
+    constexpr int VEC_SIZE = 16 / sizeof(T);
+    constexpr int D_VEC = D / VEC_SIZE;
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    int num_warps = blockDim.x / 32;
+    // 预读取 tileKV
+    int first_tile_rows = min(Bc, kv_token_end - kv_token_idx);
+    for (int k_i = warp_id; k_i < first_tile_rows; k_i += num_warps) {
+        #pragma unroll
+        for (int d_vec = lane_id; d_vec < D_VEC; d_vec += 32) {
+            __pipeline_memcpy_async(
+                &s_k[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE], 
+                k_base_ptr + k_i * k_stride_token + d_vec * VEC_SIZE, 
+                16
+            );
+            __pipeline_memcpy_async(
+                &s_v[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE], 
+                v_base_ptr + k_i * v_stride_token + d_vec * VEC_SIZE, 
+                16
+            );
+        }
+    }
+    __pipeline_commit();
+
+    for (int q_i = warp_id; q_i < q_block_rows; q_i += num_warps) {
+        uint4* s_q_row = reinterpret_cast<uint4*>(&s_q[q_i * D]);
+        const uint4* g_q_row = reinterpret_cast<const uint4*>(q_base_ptr + q_i * q_stride_token);
+
+        #pragma unroll
+        for (int d_vec = lane_id; d_vec < D_VEC; d_vec += 32) {
+            s_q_row[d_vec] = g_q_row[d_vec];
+        }
+    }
+    __syncthreads();
+
+    /* 遍历 tileQ(每个 warp 负责一行的 qkv 计算) */
+    int q_block_start = q_block_idx * Br;
+    for (int q_tile_start = 0; q_tile_start < q_block_rows; q_tile_start += num_warps) {
+        int q_row_idx = q_tile_start + warp_id;
+        int q_global = q_block_start + q_row_idx;
+        float row_max = -1e20f;
+        float row_sum = 0.0f;
+        float acc[D / 32] = {0.0f};
+        float q_buf[D / 32];
+
+        if (q_row_idx < q_block_rows) {
+            #pragma unroll
+            for (int d_i = lane_id; d_i < D; d_i += 32) {
+                q_buf[d_i / 32] = static_cast<float>(s_q[q_row_idx * D + d_i]);
+            }
+        }
+
+        /* 遍历 tileK & tileV */
+        for (int kv_tile_start = 0; kv_tile_start < kv_token_end - kv_token_idx; kv_tile_start += Bc) {
+            int kv_tile_global_start = kv_tile_start;
+            if (is_causal && kv_tile_global_start >= q_block_end) break;            // 如果是 causal 模式且整个 tileK 都在 tileQ 的右边，则后续的 tileK 都不需要处理了，直接 break
+
+            int current_tile_rows = min(Bc, kv_token_end - kv_token_idx - kv_tile_start);
+
+            // 将 tileK & tileV(Br, D) 加载到 shared memory(每个 warp 负责一行, 所有线程都参与搬运)
+            __pipeline_wait_prior(0);
+            __syncthreads();
+            read_ptr_toggle = write_ptr_toggle;             // 切换读指针
+            write_ptr_toggle = 1 - write_ptr_toggle;        // 切换写指针
+            int next_kv_tile_start = kv_tile_start + Bc;
+            if (next_kv_tile_start < kv_token_end - kv_token_idx) {
+                int next_tile_rows = min(Bc, kv_token_end - kv_token_idx - next_kv_tile_start);
+                for (int k_i = warp_id; k_i < next_tile_rows; k_i += num_warps) {
+                    #pragma unroll
+                    for (int d_vec = lane_id; d_vec < D_VEC; d_vec += 32) {
+                        __pipeline_memcpy_async(
+                            &s_k[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE], 
+                            k_base_ptr + (next_kv_tile_start + k_i) * k_stride_token + d_vec * VEC_SIZE, 
+                            16
+                        );
+                        __pipeline_memcpy_async(
+                            &s_v[write_ptr_toggle * Bc * D + k_i * D + d_vec * VEC_SIZE], 
+                            v_base_ptr + (next_kv_tile_start + k_i) * v_stride_token + d_vec * VEC_SIZE, 
+                            16
+                        );
+                    }
+                }
+                __pipeline_commit();
+            }
+
+            /* 核心计算逻辑 */
+            // 分配到 q_row 的 warp 参与接下来的计算
+            if (q_row_idx < q_block_rows) {
+                for (int k_i = 0; k_i < current_tile_rows; ++k_i) {
+                    float attn_score = 0.0f;
+                    if (!(is_causal && kv_tile_global_start + k_i > q_global)) {
+                        #pragma unroll                                              // 每个线程计算部分点积
+                        for (int d_i = 0; d_i < D / 32; ++d_i) {
+                            float k_val = static_cast<float>(s_k[read_ptr_toggle * Bc * D + k_i * D + d_i * 32 + lane_id]);
+                            attn_score += q_buf[d_i] * k_val;
+                        }
+                        #pragma unroll                                              // warp 内规约
+                        for (int offset = 16; offset > 0; offset /= 2) {
+                            attn_score += __shfl_down_sync(0xffffffff, attn_score, offset);
+                        }
+                        attn_score = __shfl_sync(0xffffffff, attn_score, 0);        // 每个线程都拿到最终的 attn_score
+                        attn_score *= scale;                                        // 应用缩放
+                    } else {
+                        attn_score = -1e20f;                             // 整个 token 都被 mask 掉
+                    }
+
+                    float old_row_max = row_max;                                // online softmax
+                    row_max = fmaxf(row_max, attn_score);
+                    float rescale = expf(old_row_max - row_max);
+                    float exp_score = expf(attn_score - row_max);
+                    row_sum = row_sum * rescale + exp_score;
+
+                    #pragma unroll
+                    for (int d_i = 0; d_i < D / 32; ++d_i) {
+                        float v_val = static_cast<float>(s_v[read_ptr_toggle * Bc * D + k_i * D + d_i * 32 + lane_id]);
+                        acc[d_i] = acc[d_i] * rescale + exp_score * v_val;
+                    }
+                }
+            }
+        }
+        /* 计算最后一个 tileKV */
+
+        // 将 acc 写回 shared 中 q_row 的位置, 最后整个结果计算完毕用 vectorized store 写回全局内存
+        if (q_row_idx < q_block_rows) {
+            #pragma unroll
+            for (int d_i = lane_id; d_i < D; d_i += 32) {
+                float inv_sum = row_sum > 0 ? 1.f / row_sum : 0.f;
+                s_o[q_row_idx * D + d_i] = static_cast<T>(acc[d_i / 32] * inv_sum);
+            }
+        }
+    }
+    __syncthreads();
+
+    /* 将结果从 shared memory 写回全局内存(每个 warp 负责一行) */
+    for (int q_i = warp_id; q_i < q_block_rows; q_i += num_warps) {
+        uint4* s_o_row = reinterpret_cast<uint4*>(&s_o[q_i * D]);
+        uint4* g_o_row = reinterpret_cast<uint4*>(o_base_ptr + q_i * o_stride_token);
+
+        #pragma unroll
+        for (int d_vec = lane_id; d_vec < D_VEC; d_vec += 32) {
+            g_o_row[d_vec] = s_o_row[d_vec];
+        }
+    }
+}
+
+
 template<typename T>
 void flashattn_cpu_reference(
     const T* Q,
@@ -958,10 +1175,10 @@ int main() {
     const int B = 8;
     const int H = 32;
     const int H_k = 8;
-    const int D = 128;
+    const int D = 64;
     const int Br = 32;
     const int Bc = 32;
-    const int min_seqlen_q = 256;
+    const int min_seqlen_q = 512;
 
     int q_lens[B], k_lens[B];
     for (int i = 0; i < B; ++i) {
@@ -1170,6 +1387,27 @@ int main() {
             );
         },
         (Br + 2 * Bc) * D * sizeof(T)
+    );
+
+    run_gpu_kernel(
+        "GPU flashattn_kernel_v5_async_vectorized",
+        [&](dim3 grid, dim3 block, size_t smem_size) {
+            flashattn_kernel_v5_async_vectorized<T, Br, Bc, D><<<grid, block, smem_size>>>(
+                d_Q, d_K, d_V, d_O,
+                d_cu_q, d_cu_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                scale,
+                H,
+                H_k,
+                q_stride_token, q_stride_head,
+                k_stride_token, k_stride_head,
+                v_stride_token, v_stride_head,
+                o_stride_token, o_stride_head,
+                is_causal
+            );
+        },
+        (Br + 2 * 2 * Bc) * D * sizeof(T)
     );
 
     CHECK_CUDA(cudaFree(d_Q));
