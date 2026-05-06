@@ -935,7 +935,6 @@ __global__ void flashattn_kernel_v5_async_vectorized(
                     }
                 }
             }
-            __syncthreads();
         }
         /* 计算最后一个 tileKV */
 
