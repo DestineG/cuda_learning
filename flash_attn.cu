@@ -1169,13 +1169,19 @@ void test_attention_kernel(
     CHECK_CUDA(cudaEventDestroy(stop));
 }
 
+/*
+想法：
+1. (v5)在实际的设备环境中要根据设备条件选择 kernel，双缓冲不一定总是最快的，它占用较多的 shared，在资源不足的情况下会极大地限制活跃 warp 数量，导致性能下降；而且在某些输入规模下，单缓冲反而能更好地利用资源，达到更高的性能
+2. (v4)结果先写到 shared 再用 vectorized store 写回全局内存，也不一定更快，在 tile 较小的时候，直接寄存器累加结果然后 vectorized store 回全局内存可能更快；而在 tile 较大的时候，先写到 shared 再写回全局内存可以减少全局内存访问次数，提高性能
+*/
+
 int main() {
     using T = float;
 
     const int B = 8;
     const int H = 32;
     const int H_k = 8;
-    const int D = 64;
+    const int D = 32;
     const int Br = 32;
     const int Bc = 32;
     const int min_seqlen_q = 256;
