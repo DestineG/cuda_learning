@@ -25,7 +25,7 @@ mkdir -p "$BUILD_DIR"
 echo "------------------------------------------------"
 echo "[1/3] 正在编译: $SRC -> $TARGET"
 
-$NVCC -O3 -std=c++11 -gencode arch=compute_89,code=sm_89 \
+$NVCC -O3 -std=c++17 -gencode arch=compute_89,code=sm_89 \
     -I $CUDNN_INC \
     "$SRC" -o "$TARGET" -lcublas -lcudnn
 
